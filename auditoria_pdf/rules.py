@@ -28,22 +28,15 @@ def _normalize_regimen(value: str | None) -> str | None:
     return None
 
 
-def _detect_eps(context: AuditContext) -> str:
-    candidates: list[str] = []
-    factura = context.get_mandatory(DocumentType.FACTURA)
-    if factura:
-        candidates.append(factura.raw_text.upper())
-        candidates.append(str(factura.source_path).upper())
+def _find_document(context: AuditContext, doc_type: DocumentType):
+    document = context.get_mandatory(doc_type)
+    if document is not None:
+        return document
 
-    for parsed in context.all_documents():
-        candidates.append(str(parsed.source_path).upper())
-
-    merged = " ".join(candidates)
-    if "COOSALUD" in merged:
-        return "COOSALUD"
-    if "NUEVA EPS" in merged or "NUEVAEPS" in merged:
-        return "NUEVA EPS"
-    return "DESCONOCIDA"
+    for candidate in context.additional_documents:
+        if candidate.doc_type == doc_type:
+            return candidate
+    return None
 
 
 class AuditRule(ABC):
@@ -57,34 +50,39 @@ class AuditRule(ABC):
 
 class FileSetComplianceRule(AuditRule):
     rule_id = "R0_ESTRUCTURA_LOTE"
-    description = (
-        "Validar estructura del lote: 4 a 6 PDFs, obligatorios FEV/PDE/CRC y minimo 1 adicional."
-    )
+    description = "Validar estructura del lote: FEV obligatorio y al menos otro PDF permitido."
 
     REQUIRED = (
         DocumentType.FACTURA,
-        DocumentType.AUTORIZACION,
-        DocumentType.SOPORTE,
     )
 
     def evaluate(self, context: AuditContext) -> RuleResult:
         total_parsed = len(context.all_documents())
+        effective_min_pdfs = max(context.min_pdfs, 2)
         missing_required = [
             doc_type.value
             for doc_type in self.REQUIRED
             if context.get_mandatory(doc_type) is None
         ]
+        factura = context.get_mandatory(DocumentType.FACTURA)
+        has_companion_pdf = (
+            factura is not None
+            and any(doc.source_path != factura.source_path for doc in context.all_documents())
+        )
 
         details: list[str] = []
-        if total_parsed < context.min_pdfs or total_parsed > context.max_pdfs:
+        if total_parsed < effective_min_pdfs or total_parsed > context.max_pdfs:
             details.append(
-                f"Cantidad invalida de PDFs: {total_parsed}. Permitido: {context.min_pdfs}-{context.max_pdfs}."
+                f"Cantidad invalida de PDFs: {total_parsed}. Permitido: {effective_min_pdfs}-{context.max_pdfs}."
             )
         if missing_required:
-            details.append(f"Faltan documentos obligatorios: {', '.join(missing_required)}.")
-        if len(context.additional_documents) < 1:
-            details.append("Debe existir al menos 1 documento adicional al trio FEV/PDE/CRC.")
-
+            details.append(
+                f"Faltan documentos obligatorios: {', '.join(missing_required)}."
+            )
+        if factura is not None and not has_companion_pdf:
+            details.append(
+                "Debe existir al menos un PDF adicional permitido junto a FEV."
+            )
         if not details:
             details.append("Estructura del lote valida.")
 
@@ -92,7 +90,10 @@ class FileSetComplianceRule(AuditRule):
             rule_id=self.rule_id,
             description=self.description,
             passed=len(details) == 1 and details[0] == "Estructura del lote valida.",
-            expected=f"{context.min_pdfs}-{context.max_pdfs} PDFs con FEV/PDE/CRC + >=1 adicional",
+            expected=(
+                f"{effective_min_pdfs}-{context.max_pdfs} PDFs con FEV obligatorio y "
+                "al menos un adicional (PDE/CRC/HEV/HAO/PDX u otro permitido)"
+            ),
             actual=(
                 "total="
                 f"{total_parsed}, obligatorios="
@@ -114,25 +115,27 @@ class CupsMatchRule(AuditRule):
     description = "Validar que el codigo/CUPS en FEV coincida con el codigo/CUPS en PDE."
 
     def evaluate(self, context: AuditContext) -> RuleResult:
-        if _detect_eps(context) == "COOSALUD":
+        factura = _find_document(context, DocumentType.FACTURA)
+        autorizacion = _find_document(context, DocumentType.AUTORIZACION)
+
+        if not factura:
+            return RuleResult(
+                rule_id=self.rule_id,
+                description=self.description,
+                passed=False,
+                details=["Falta FEV para ejecutar la comparacion."],
+            )
+
+        if not autorizacion:
             return RuleResult(
                 rule_id=self.rule_id,
                 description=self.description,
                 passed=True,
                 expected="N/A",
                 actual="N/A",
-                details=["Comparacion de codigo/CUPS omitida para COOSALUD por regla de negocio."],
-            )
-
-        factura = context.get_mandatory(DocumentType.FACTURA)
-        autorizacion = context.get_mandatory(DocumentType.AUTORIZACION)
-
-        if not factura or not autorizacion:
-            return RuleResult(
-                rule_id=self.rule_id,
-                description=self.description,
-                passed=False,
-                details=["Falta FEV o PDE para ejecutar la comparacion."],
+                details=[
+                    "No se encontro PDE; comparacion de codigo/CUPS omitida porque PDE es opcional."
+                ],
             )
 
         cups_factura = factura.cups_codes
@@ -179,6 +182,28 @@ class CupsMatchRule(AuditRule):
         )
 
 
+class CupsMatchSkippedRule(AuditRule):
+    rule_id = CupsMatchRule.rule_id
+    description = CupsMatchRule.description
+
+    def __init__(self, eps_name: str, reason: str = "regla de negocio") -> None:
+        self._eps_name = eps_name
+        self._reason = reason
+
+    def evaluate(self, context: AuditContext) -> RuleResult:
+        return RuleResult(
+            rule_id=self.rule_id,
+            description=self.description,
+            passed=True,
+            expected="N/A",
+            actual="N/A",
+            details=[
+                "Comparacion de codigo/CUPS omitida para "
+                f"{self._eps_name} por {self._reason}."
+            ],
+        )
+
+
 class PatientDocumentConsistencyRule(AuditRule):
     rule_id = "R2_DOCUMENTO_FEV_VS_TODOS"
     description = (
@@ -186,7 +211,7 @@ class PatientDocumentConsistencyRule(AuditRule):
     )
 
     def evaluate(self, context: AuditContext) -> RuleResult:
-        factura = context.get_mandatory(DocumentType.FACTURA)
+        factura = _find_document(context, DocumentType.FACTURA)
         if not factura:
             return RuleResult(
                 rule_id=self.rule_id,
@@ -213,8 +238,10 @@ class PatientDocumentConsistencyRule(AuditRule):
             return RuleResult(
                 rule_id=self.rule_id,
                 description=self.description,
-                passed=False,
-                details=["No hay documentos adicionales para comparar contra FEV."],
+                passed=True,
+                expected=reference_document,
+                actual=f"FEV:{reference_document}",
+                details=["No hay documentos adicionales para comparar; regla omitida."],
             )
 
         details: list[str] = []
@@ -255,15 +282,25 @@ class RegimenConsistencyRule(AuditRule):
     description = "Verificar regimen del paciente entre FEV y PDE (solo Subsidiado o Contributivo)."
 
     def evaluate(self, context: AuditContext) -> RuleResult:
-        factura = context.get_mandatory(DocumentType.FACTURA)
-        autorizacion = context.get_mandatory(DocumentType.AUTORIZACION)
+        factura = _find_document(context, DocumentType.FACTURA)
+        autorizacion = _find_document(context, DocumentType.AUTORIZACION)
 
-        if not factura or not autorizacion:
+        if not factura:
             return RuleResult(
                 rule_id=self.rule_id,
                 description=self.description,
                 passed=False,
-                details=["Falta FEV o PDE para comparar regimen."],
+                details=["Falta FEV para comparar regimen."],
+            )
+
+        if not autorizacion:
+            return RuleResult(
+                rule_id=self.rule_id,
+                description=self.description,
+                passed=True,
+                expected="N/A",
+                actual="N/A",
+                details=["No se encontro PDE; comparacion de regimen omitida porque PDE es opcional."],
             )
 
         regimen_factura = _normalize_regimen(factura.regimen)

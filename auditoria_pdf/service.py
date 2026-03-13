@@ -4,35 +4,34 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from auditoria_pdf.domain import AuditContext, AuditReport, DocumentType, ParsedDocument
+from auditoria_pdf.audit import (
+    PREFIX_TO_TYPE,
+    REQUIRED_TYPES,
+    AuditContextFactory,
+    AuditRuleEngine,
+    DocumentRetryPolicy,
+    DocumentTypeResolver,
+    HevPatientDocumentResolver,
+    PageLimitResolver,
+    PdfPathValidator,
+    RenderFallbackPolicy,
+    SinglePdfProcessingEngine,
+    UniquePdfPathCollector,
+)
+from auditoria_pdf.domain import AuditReport, DocumentType
+from auditoria_pdf.eps_profiles import CoosaludAuditProfile, EpsAuditProfile
 from auditoria_pdf.extractor import PdfTextExtractor
-from auditoria_pdf.parsers import BaseDocumentParser, build_default_parser_registry
-from auditoria_pdf.rules import (
-    AuditRule,
-    CupsMatchRule,
-    FileSetComplianceRule,
-    PatientDocumentConsistencyRule,
-    RegimenConsistencyRule,
+from auditoria_pdf.parsing import (
+    BaseDocumentParser,
+    PrefixAwareDocumentParserResolver,
+    build_default_parser_resolver,
 )
-
-
-REQUIRED_TYPES = (
-    DocumentType.FACTURA,
-    DocumentType.AUTORIZACION,
-    DocumentType.SOPORTE,
-)
-
-PREFIX_TO_TYPE: dict[str, DocumentType] = {
-    "FEV": DocumentType.FACTURA,
-    "PDE": DocumentType.AUTORIZACION,
-    "CRC": DocumentType.SOPORTE,
-    "HEV": DocumentType.VALIDADOR,
-}
+from auditoria_pdf.rules import AuditRule
 
 
 def detect_document_type(pdf_path: Path) -> tuple[DocumentType, str]:
-    prefix = pdf_path.name.split("_", 1)[0].upper()
-    return PREFIX_TO_TYPE.get(prefix, DocumentType.ADICIONAL), prefix
+    detected = DocumentTypeResolver(prefix_to_type=PREFIX_TO_TYPE).detect(pdf_path)
+    return detected.doc_type, detected.prefix
 
 
 class PdfAuditService:
@@ -40,95 +39,127 @@ class PdfAuditService:
         self,
         extractor: PdfTextExtractor | None = None,
         parser_registry: dict[DocumentType, BaseDocumentParser] | None = None,
+        parser_resolver: PrefixAwareDocumentParserResolver | None = None,
         rules: list[AuditRule] | None = None,
-        min_pdfs: int = 4,
+        profile: EpsAuditProfile | None = None,
+        min_pdfs: int = 2,
         max_pdfs: int = 6,
+        document_type_resolver: DocumentTypeResolver | None = None,
+        path_collector: UniquePdfPathCollector | None = None,
+        path_validator: PdfPathValidator | None = None,
+        processing_engine: SinglePdfProcessingEngine | None = None,
+        hev_patient_document_resolver: HevPatientDocumentResolver | None = None,
+        context_factory: AuditContextFactory | None = None,
+        rule_engine: AuditRuleEngine | None = None,
     ) -> None:
         self.extractor = extractor or PdfTextExtractor()
-        self.parser_registry = parser_registry or build_default_parser_registry()
+        self.profile = profile or CoosaludAuditProfile()
+
         self.min_pdfs = min_pdfs
         self.max_pdfs = max_pdfs
-        self.rules = rules or [
-            FileSetComplianceRule(),
-            CupsMatchRule(),
-            PatientDocumentConsistencyRule(),
-            RegimenConsistencyRule(),
-        ]
-        self.page_limits: dict[DocumentType, int] = {
-            DocumentType.FACTURA: 2,
-            DocumentType.AUTORIZACION: 2,
-            DocumentType.SOPORTE: 2,
-            DocumentType.VALIDADOR: 3,
-            DocumentType.ADICIONAL: 2,
-        }
-        self.render_fallback_types: set[DocumentType] = {
-            DocumentType.FACTURA,
-            DocumentType.AUTORIZACION,
-            DocumentType.SOPORTE,
-        }
+
+        self.page_limits = dict(self.profile.page_limits())
+        self.render_fallback_types = set(self.profile.render_fallback_types())
+
+        self.path_collector = path_collector or UniquePdfPathCollector()
+        self.path_validator = path_validator or PdfPathValidator()
+        self.document_type_resolver = document_type_resolver or DocumentTypeResolver(
+            prefix_to_type=PREFIX_TO_TYPE
+        )
+
+        default_parser_resolver = parser_resolver or build_default_parser_resolver()
+        effective_parser_registry = dict(self.profile.parser_overrides())
+        if parser_registry is not None:
+            effective_parser_registry.update(parser_registry)
+
+        if effective_parser_registry:
+            prefix_parsers = dict(default_parser_resolver.prefix_parsers)
+            type_parsers = dict(default_parser_resolver.type_parsers)
+            type_parsers.update(effective_parser_registry)
+            for prefix, document_type in PREFIX_TO_TYPE.items():
+                parser_from_registry = type_parsers.get(document_type)
+                if parser_from_registry is not None:
+                    prefix_parsers[prefix] = parser_from_registry
+            default_parser_resolver = PrefixAwareDocumentParserResolver(
+                prefix_parsers=prefix_parsers,
+                type_parsers=type_parsers,
+            )
+        self.parser_registry = default_parser_resolver.type_parsers
+        self.parser_resolver = default_parser_resolver
+
+        self.processing_engine = processing_engine or SinglePdfProcessingEngine(
+            extractor=self.extractor,
+            page_limit_resolver=PageLimitResolver(self.page_limits),
+            render_fallback_policy=RenderFallbackPolicy(self.render_fallback_types),
+            retry_policy=DocumentRetryPolicy(),
+        )
+        self.hev_patient_document_resolver = (
+            hev_patient_document_resolver or HevPatientDocumentResolver()
+        )
+
+        self.context_factory = context_factory or AuditContextFactory(
+            min_pdfs=self.min_pdfs,
+            max_pdfs=self.max_pdfs,
+        )
+
+        default_rules = rules or self.profile.build_rules()
+        self.rules = default_rules
+        self.rule_engine = rule_engine or AuditRuleEngine(default_rules)
 
     def audit(self, pdf_paths: Iterable[Path]) -> AuditReport:
-        unique_paths = [Path(path) for path in dict.fromkeys(pdf_paths)]
+        unique_paths = self.path_collector.collect(pdf_paths)
         mandatory_documents = {}
         additional_documents = []
         errors: list[str] = []
 
-        for path in unique_paths:
-            if not path.exists():
-                errors.append(f"No existe archivo: {path}")
+        for source_path in unique_paths:
+            path_error = self.path_validator.validate(source_path)
+            if path_error:
+                errors.append(path_error)
                 continue
 
-            if path.suffix.lower() != ".pdf":
-                errors.append(f"Archivo no PDF ignorado: {path}")
-                continue
-
-            document_type, prefix = detect_document_type(path)
-            parser = self.parser_registry.get(document_type)
+            detected = self.document_type_resolver.detect(source_path)
+            parser = self.parser_resolver.resolve(detected.doc_type, detected.prefix)
             if not parser:
                 errors.append(
-                    f"No hay parser configurado para tipo {document_type.value} ({path.name})."
+                    "No hay parser configurado para tipo "
+                    f"{detected.doc_type.value} ({source_path.name})."
                 )
                 continue
 
             try:
-                page_limit = self.page_limits.get(document_type)
-                allow_render_fallback = document_type in self.render_fallback_types
-                raw_text = self.extractor.extract_text_limited(
-                    path,
-                    max_pages=page_limit,
-                    allow_render_fallback=allow_render_fallback,
+                parsed = self.processing_engine.process(
+                    source_path=source_path,
+                    document_type=detected.doc_type,
+                    prefix=detected.prefix,
+                    parser=parser,
                 )
-                parsed = parser.parse(path, raw_text, prefix=prefix)
-
-                if self._needs_full_retry(document_type, parsed):
-                    raw_text_full = self.extractor.extract_text_limited(
-                        path,
-                        max_pages=None,
-                        allow_render_fallback=allow_render_fallback,
-                    )
-                    parsed = parser.parse(path, raw_text_full, prefix=prefix)
             except Exception as exc:  # pragma: no cover
-                errors.append(f"Error procesando {path.name}: {exc}")
+                errors.append(f"Error procesando {source_path.name}: {exc}")
                 continue
 
-            if document_type in REQUIRED_TYPES:
-                if document_type in mandatory_documents:
+            if detected.doc_type in REQUIRED_TYPES:
+                if detected.doc_type in mandatory_documents:
                     errors.append(
-                        f"Documento obligatorio duplicado ({document_type.value}): {path.name}"
+                        "Documento obligatorio duplicado "
+                        f"({detected.doc_type.value}): {source_path.name}"
                     )
                     continue
-                mandatory_documents[document_type] = parsed
+                mandatory_documents[detected.doc_type] = parsed
             else:
                 additional_documents.append(parsed)
 
-        context = AuditContext(
+        self.hev_patient_document_resolver.reconcile(
+            mandatory_documents=mandatory_documents,
+            additional_documents=additional_documents,
+        )
+
+        context = self.context_factory.build(
             mandatory_documents=mandatory_documents,
             additional_documents=additional_documents,
             total_input_pdfs=len(unique_paths),
-            min_pdfs=self.min_pdfs,
-            max_pdfs=self.max_pdfs,
         )
-        rule_results = [rule.evaluate(context) for rule in self.rules]
+        rule_results = self.rule_engine.evaluate(context)
 
         return AuditReport(
             generated_at=datetime.now(),
@@ -136,10 +167,3 @@ class PdfAuditService:
             rule_results=rule_results,
             errors=errors,
         )
-
-    def _needs_full_retry(self, document_type: DocumentType, parsed: ParsedDocument) -> bool:
-        if document_type in {DocumentType.FACTURA, DocumentType.AUTORIZACION}:
-            return not parsed.patient_document or not parsed.regimen
-        if document_type in {DocumentType.SOPORTE, DocumentType.VALIDADOR, DocumentType.ADICIONAL}:
-            return not parsed.patient_document
-        return False

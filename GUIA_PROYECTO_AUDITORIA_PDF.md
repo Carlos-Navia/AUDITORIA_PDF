@@ -9,9 +9,9 @@ El sistema procesa lotes de PDFs por caso, extrae informacion clave (documento d
 ## 2) Reglas que valida el sistema
 
 1. Estructura del lote:
-   - Entre 4 y 6 PDFs por caso (configurable).
-   - Obligatorios: `FEV`, `PDE`, `CRC`.
-   - Al menos 1 PDF adicional (`HEV`, `HAO`, `PDX` u otro prefijo).
+   - Obligatorios: `FEV` y `PDE`.
+   - `CRC` se mantiene como archivo permitido, pero no obligatorio.
+   - Se permite trabajar con otros adicionales (`HEV`, `HAO`, `PDX`, etc.).
 2. CUPS entre factura y autorizacion:
    - Compara codigos/CUPS de `FEV` vs `PDE`.
    - Excepcion: si detecta `COOSALUD`, omite esta comparacion por regla de negocio.
@@ -115,7 +115,7 @@ python main.py `
 
 ### Argumentos utiles
 
-- `--min-pdfs 4 --max-pdfs 6`: rango permitido por lote.
+- `--min-pdfs 2 --max-pdfs 6`: rango permitido por lote.
 - `--output-excel "ruta\reporte.xlsx"`: define salida Excel.
 - `--output-json "ruta\reporte.json"`: genera salida JSON.
 - `--tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"`: ruta manual de Tesseract.
@@ -167,7 +167,23 @@ Cada carpeta que contenga PDFs se procesa como un caso independiente.
    - Revisar calidad del PDF (escaneo, rotacion, ruido).
    - Confirmar que sean realmente `.pdf`.
 3. Falla por estructura del lote:
-   - Confirmar obligatorios `FEV`, `PDE`, `CRC`.
-   - Confirmar al menos 1 adicional.
-   - Ajustar `--min-pdfs` / `--max-pdfs` si aplica.
+   - Confirmar presencia de `FEV` y `PDE`.
+   - `CRC` es opcional.
+   - Revisar nombres/extensiones si no aparecen en el reporte.
 
+## 11) Formatos HEV documentados (COOSALUD)
+
+Para `HEV` se adicionaron reglas especificas para layouts manuales nuevos de COOSALUD.  
+El dato objetivo de documento se busca solo en el campo de identificacion del usuario/paciente.
+
+Formatos soportados:
+
+1. `FICHA DE EDUCACION INDIVIDUAL (FO-GS-ED-12-HS)`
+   - Campo objetivo: `Numero de identificacion`.
+   - Se prioriza ese campo antes de firmas o bloques de educador.
+2. `FORMATO DE DEMANDA INDUCIDA (COOSALUD) (FO-MI-CR-15-HS)`
+   - Campo objetivo: `Numero Identificacion` (seccion datos personales del usuario).
+   - Se ignoran numeros de celular y datos de firma.
+
+Nota tecnica:
+- Si el OCR de HEV queda degradado y no entrega un documento confiable, el sistema usa el documento de referencia de `FEV` del mismo caso para evitar falsos negativos en HEV, dejando trazabilidad en metadata.

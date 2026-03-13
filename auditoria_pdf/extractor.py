@@ -2,16 +2,22 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import re
+import unicodedata
 
 from PIL import Image
 from pypdf import PdfReader
 import pytesseract
 from pytesseract import TesseractNotFoundError
 
+from auditoria_pdf.mupdf_runtime import configure_mupdf_logging
+
 try:
     import fitz  # type: ignore
 except Exception:  # pragma: no cover
     fitz = None
+else:
+    configure_mupdf_logging(fitz)
 
 
 class PdfTextExtractor:
@@ -31,6 +37,22 @@ class PdfTextExtractor:
         "paciente",
         "nombres",
     )
+    OCR_CONTEXT_ANCHORS = (
+        "documento",
+        "identific",
+        "afili",
+        "regimen",
+        "tipo usuario",
+        "paciente",
+        "nombres",
+        "numero",
+        "coosalud",
+        "sanitas",
+        "cedula",
+        "subsidiado",
+    )
+    OCR_ROTATION_ANGLES = (90, 180, 270)
+    MIN_OCR_IMAGE_BYTES = 30_000
 
     def __init__(
         self,
@@ -52,9 +74,12 @@ class PdfTextExtractor:
         pdf_path: Path,
         max_pages: int | None = None,
         allow_render_fallback: bool = True,
+        ocr_psm: int = 6,
+        force_render_fallback: bool = False,
     ) -> str:
         reader = PdfReader(str(pdf_path))
-        render_doc = self._open_render_doc(pdf_path)
+        render_doc = None
+        render_doc_attempted = False
         chunks: list[str] = []
 
         try:
@@ -63,16 +88,26 @@ class PdfTextExtractor:
                     break
 
                 native_text = (page.extract_text() or "").strip()
-                image_ocr_text = self._ocr_page_images(page)
+                image_ocr_text = self._ocr_page_images(page, ocr_psm=ocr_psm)
                 merged_text = self._merge_texts(native_text, image_ocr_text)
 
                 if (
                     allow_render_fallback
-                    and self._should_use_render_ocr(merged_text)
-                    and render_doc is not None
+                    and (
+                        force_render_fallback
+                        or self._should_use_render_ocr(merged_text)
+                    )
                 ):
-                    render_ocr_text = self._ocr_rendered_page(render_doc, page_index)
-                    merged_text = self._merge_texts(merged_text, render_ocr_text)
+                    if render_doc is None and not render_doc_attempted:
+                        render_doc = self._open_render_doc(pdf_path)
+                        render_doc_attempted = True
+                    if render_doc is not None:
+                        render_ocr_text = self._ocr_rendered_page(
+                            render_doc,
+                            page_index,
+                            ocr_psm=ocr_psm,
+                        )
+                        merged_text = self._merge_texts(merged_text, render_ocr_text)
 
                 if merged_text:
                     chunks.append(merged_text)
@@ -92,25 +127,46 @@ class PdfTextExtractor:
                 pytesseract.pytesseract.tesseract_cmd = str(candidate)
                 return
 
-    def _ocr_page_images(self, page) -> str:
+    def _ocr_page_images(self, page, ocr_psm: int = 6) -> str:
         images = list(page.images)
         if not images:
             return ""
 
+        large_images = [
+            image_file
+            for image_file in images
+            if len(image_file.data) >= self.MIN_OCR_IMAGE_BYTES
+        ]
+
+        ocr_blocks = self._ocr_image_collection(large_images, ocr_psm=ocr_psm)
+        if ocr_blocks:
+            return "\n".join(ocr_blocks)
+
+        # Fallback to every image when large-image OCR produced nothing.
+        ocr_blocks = self._ocr_image_collection(images, ocr_psm=ocr_psm)
+        if not ocr_blocks:
+            return ""
+
+        return "\n".join(ocr_blocks)
+
+    def _ocr_image_collection(self, images, ocr_psm: int = 6) -> list[str]:
         ocr_blocks: list[str] = []
         for image_file in images:
             try:
                 with Image.open(BytesIO(image_file.data)) as image:
                     processed = image.convert("L")
-                    text = self._safe_ocr(processed, psm=6)
+                    text = self._ocr_with_orientation_candidates(
+                        processed,
+                        psm=ocr_psm,
+                        always_try_rotations=ocr_psm == 3,
+                    )
                     stripped = text.strip()
                     if stripped:
                         ocr_blocks.append(stripped)
             except Exception:
                 # Ignore malformed image resources and continue.
                 continue
-
-        return "\n".join(ocr_blocks)
+        return ocr_blocks
 
     def _open_render_doc(self, pdf_path: Path):
         if fitz is None:
@@ -120,14 +176,18 @@ class PdfTextExtractor:
         except Exception:
             return None
 
-    def _ocr_rendered_page(self, render_doc, page_index: int) -> str:
+    def _ocr_rendered_page(self, render_doc, page_index: int, ocr_psm: int = 6) -> str:
         try:
             page = render_doc[page_index]
             matrix = fitz.Matrix(self.render_zoom, self.render_zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             with Image.open(BytesIO(pix.tobytes("png"))) as image:
                 processed = image.convert("L")
-                text = self._safe_ocr(processed, psm=6)
+                text = self._ocr_with_orientation_candidates(
+                    processed,
+                    psm=ocr_psm,
+                    always_try_rotations=ocr_psm == 3,
+                )
                 return text.strip()
         except Exception:
             return ""
@@ -144,11 +204,71 @@ class PdfTextExtractor:
                 "No se encontro Tesseract. Configura --tesseract-cmd o instala Tesseract OCR."
             ) from exc
 
+    def _ocr_with_orientation_candidates(
+        self,
+        image: Image.Image,
+        psm: int,
+        always_try_rotations: bool = False,
+    ) -> str:
+        baseline_text = self._safe_ocr(image, psm=psm).strip()
+        best_text = baseline_text
+        best_score = self._score_ocr_text(baseline_text)
+
+        if not always_try_rotations and not self._needs_rotation_retry(baseline_text):
+            return baseline_text
+
+        for angle in self.OCR_ROTATION_ANGLES:
+            rotated = image.rotate(angle, expand=True)
+            candidate_text = self._safe_ocr(rotated, psm=psm).strip()
+            candidate_score = self._score_ocr_text(candidate_text)
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_text = candidate_text
+
+        return best_text
+
+    def _needs_rotation_retry(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        return self._score_ocr_text(stripped) < 70
+
+    def _score_ocr_text(self, text: str) -> int:
+        stripped = text.strip()
+        if not stripped:
+            return 0
+
+        normalized = self._normalize_text_for_scoring(stripped)
+        anchor_hits = sum(normalized.count(anchor) for anchor in self.OCR_CONTEXT_ANCHORS)
+        strong_digit_hits = len(re.findall(r"\b\d{6,12}\b", normalized))
+        alpha_chars = sum(1 for char in normalized if "a" <= char <= "z")
+
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        line_count = max(1, len(lines))
+        short_lines = sum(1 for line in lines if len(line) <= 2)
+        short_line_penalty = int((short_lines / line_count) * 60)
+
+        score = 0
+        score += anchor_hits * 18
+        score += strong_digit_hits * 10
+        score += min(alpha_chars, 900) // 25
+        score -= short_line_penalty
+        return score
+
+    def _normalize_text_for_scoring(self, text: str) -> str:
+        normalized = unicodedata.normalize("NFD", text)
+        without_accents = "".join(
+            char for char in normalized if unicodedata.category(char) != "Mn"
+        )
+        return without_accents.lower()
+
     def _should_use_render_ocr(self, text: str) -> bool:
         stripped = text.strip()
         if not stripped:
             return True
         if len(stripped) < self.min_native_chars:
+            return True
+        if self._score_ocr_text(stripped) < 45:
             return True
 
         lower = stripped.lower()

@@ -68,8 +68,8 @@ class AuditExcelExporter:
                 )
             ]
 
-        factura = report.context.get_mandatory(DocumentType.FACTURA)
-        autorizacion = report.context.get_mandatory(DocumentType.AUTORIZACION)
+        factura = self._find_document(report, DocumentType.FACTURA)
+        autorizacion = self._find_document(report, DocumentType.AUTORIZACION)
 
         document_reference = factura.patient_document if factura else None
         regimen_factura = factura.regimen if factura else None
@@ -107,6 +107,20 @@ class AuditExcelExporter:
                 }
             )
         return rows
+
+    def _find_document(
+        self,
+        report: AuditReport,
+        document_type: DocumentType,
+    ) -> ParsedDocument | None:
+        document = report.context.get_mandatory(document_type)
+        if document is not None:
+            return document
+
+        for candidate in report.context.additional_documents:
+            if candidate.doc_type == document_type:
+                return candidate
+        return None
 
     def _build_document_status(
         self, parsed: ParsedDocument, document_reference: str | None

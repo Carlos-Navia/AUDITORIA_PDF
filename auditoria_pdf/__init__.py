@@ -1,4 +1,9 @@
-from auditoria_pdf.batch import BatchAuditRunner, CaseAuditResult, PdfCaseScanner
+from auditoria_pdf.batch import (
+    BatchAuditRunner,
+    CaseAuditResult,
+    PdfCaseScanner,
+    rename_cuv_file,
+)
 from auditoria_pdf.domain import (
     AuditContext,
     AuditReport,
@@ -20,4 +25,5 @@ __all__ = [
     "PdfCaseScanner",
     "PdfAuditService",
     "RuleResult",
+    "rename_cuv_file",
 ]
